@@ -36,14 +36,14 @@ function Invoke-Native {
     $info.UseShellExecute = $false
     $info.RedirectStandardOutput = [bool]$Capture
     $info.RedirectStandardInput = $PSBoundParameters.ContainsKey('StdinText')
-    if ($info.RedirectStandardInput) { $info.StandardInputEncoding = $utf8NoBom }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $info
     try {
         [void]$process.Start()
         if ($info.RedirectStandardInput) {
-            $process.StandardInput.Write($StdinText)
-            $process.StandardInput.Close()
+            # .NET Framework (Windows PowerShell 5.1) has no StandardInputEncoding property.
+            $writer = New-Object System.IO.StreamWriter($process.StandardInput.BaseStream, $utf8NoBom)
+            try { $writer.Write($StdinText) } finally { $writer.Dispose() }
         }
         $outputText = if ($Capture) { $process.StandardOutput.ReadToEnd() } else { '' }
         $process.WaitForExit()
@@ -55,11 +55,20 @@ function Invoke-Native {
 function Protect-PrivateFile([string]$Path) {
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     $acl = New-Object System.Security.AccessControl.FileSecurity
-    $acl.SetOwner($sid)
+    # OpenSSH keys may grant their owner Modify but not WRITE_OWNER.
+    # Owners can still update the DACL; do not request an unnecessary owner change.
+    $owner = (Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier])
+    if ($owner -ne $sid) { $acl.SetOwner($sid) }
     $acl.SetAccessRuleProtection($true, $false)
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
     [void]$acl.AddAccessRule($rule)
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    # Set-Acl can require SeSecurityPrivilege when protecting an already protected file.
+    # Persist only the modified owner and access rules, leaving audit settings untouched.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        [System.IO.File]::SetAccessControl($Path, $acl)
+    } else {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl([System.IO.FileInfo]::new($Path), $acl)
+    }
 }
 
 function Read-SSHConfig([string]$Path) {
